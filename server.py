@@ -71,7 +71,7 @@ async def ask(request: Request):
     return {"ok": True, "call_sid": call.sid}
 
 
-@app.get("/voice/twiml")
+@app.api_route("/voice/twiml", methods=["GET", "POST"])
 async def voice_twiml(session_id: str):
     """
     Twilio hits this the moment the call connects. Returns TwiML that
