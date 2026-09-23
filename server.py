@@ -1,136 +1,136 @@
 """
-Minimal GitHub webhook receiver — step 1 of the Copilot-watcher pipeline.
+Orchestrator — the one piece of this system that needs to be publicly
+reachable. Everything else (the LangGraph agent + driver) can run on your
+machine or an internal VM and only ever makes OUTBOUND calls to this
+service.
 
-What this does right now:
-  1. Verifies the incoming request really came from GitHub (HMAC signature check)
-  2. Parses issue_comment / pull_request / pull_request_review_comment events
-  3. Filters for activity from the Copilot coding agent bot account
-  4. Logs it so you can see, live, when Copilot posts something
+Flow:
+  1. Driver POSTs a question to /ask  (outbound from driver — always works)
+  2. This service calls Twilio's REST API to dial you
+  3. Twilio hits /voice/twiml when the call connects -> we return TwiML
+     that speaks the question and gathers your spoken answer
+  4. Twilio hits /voice/answer with the transcribed speech -> we store it
+  5. Driver polls GET /answer/{session_id} (outbound — always works) until
+     the answer is ready
 
-What this does NOT do yet (next steps):
-  - Classify the comment as DONE / BLOCKED / PROGRESS (step 2)
-  - Trigger a Twilio call (step 3)
-  - Post your answer back to GitHub (step 4)
-
-Run:
-    pip install fastapi uvicorn
-    export GITHUB_WEBHOOK_SECRET="the-secret-you-set-in-github"
-    uvicorn server:app --host 0.0.0.0 --port 8000 --reload
-
-Then point ngrok at it:
-    ngrok http 8000
-and put the ngrok URL + "/webhook" as the Payload URL in your GitHub webhook settings.
+Storage is a plain in-memory dict — fine for local testing. If this
+process restarts mid-call, pending sessions are lost; swap for Redis/a
+DB before this needs to survive that.
 """
 
-import hashlib
-import hmac
-import json
 import logging
 import os
-from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import PlainTextResponse
+from twilio.rest import Client as TwilioClient
+from twilio.twiml.voice_response import Gather, VoiceResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("copilot-watcher")
+log = logging.getLogger("orchestrator")
 
 app = FastAPI()
 
-WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]  # your Twilio number
+TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]  # YOUR phone, gets called
+# Public base URL of THIS service once deployed, e.g. https://your-app.onrender.com
+# (no trailing slash). Twilio needs this to know where to fetch TwiML from
+# and where to POST the transcribed answer.
+BASE_URL = os.environ["ORCHESTRATOR_BASE_URL"].rstrip("/")
 
-# The Copilot coding agent's bot identity on github.com.
-# It shows up as login "Copilot" (user id 198982749, type "Bot") on comments/PRs,
-# and as "copilot-swe-agent[bot]" on commit authorship.
-COPILOT_LOGINS = {"copilot", "copilot-swe-agent[bot]"}
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-
-def verify_signature(raw_body: bytes, signature_header: Optional[str]) -> None:
-    """Reject anything that isn't validly signed by GitHub with our shared secret."""
-    if not WEBHOOK_SECRET:
-        # Fine for a first local test, but don't run this publicly reachable without a secret.
-        log.warning("No GITHUB_WEBHOOK_SECRET set — skipping signature verification!")
-        return
-    if not signature_header or not signature_header.startswith("sha256="):
-        raise HTTPException(status_code=401, detail="Missing/invalid signature header")
-
-    expected = hmac.new(WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
-    provided = signature_header.removeprefix("sha256=")
-    if not hmac.compare_digest(expected, provided):
-        raise HTTPException(status_code=401, detail="Signature mismatch")
+# session_id -> {"question": str, "answer": str | None}
+SESSIONS: dict = {}
 
 
-def is_from_copilot(login: Optional[str]) -> bool:
-    return (login or "").lower() in COPILOT_LOGINS
+@app.post("/ask")
+async def ask(request: Request):
+    """
+    Called by the LangGraph driver when its agent hits interrupt().
+    Body: {"session_id": "...", "question": "..."}
+    Places the outbound call and returns immediately — the driver polls
+    /answer/{session_id} separately.
+    """
+    body = await request.json()
+    session_id = body["session_id"]
+    question = body["question"]
+
+    SESSIONS[session_id] = {"question": question, "answer": None}
+    log.info("New session %s: %s", session_id, question)
+
+    call = twilio_client.calls.create(
+        to=TWILIO_TO_NUMBER,
+        from_=TWILIO_FROM_NUMBER,
+        url=f"{BASE_URL}/voice/twiml?session_id={session_id}",
+    )
+    log.info("Placed call %s for session %s", call.sid, session_id)
+
+    return {"ok": True, "call_sid": call.sid}
 
 
-@app.post("/webhook")
-async def github_webhook(
-    request: Request,
-    x_hub_signature_256: Optional[str] = Header(default=None),
-    x_github_event: Optional[str] = Header(default=None),
-):
-    raw_body = await request.body()
-    verify_signature(raw_body, x_hub_signature_256)
-    payload = json.loads(raw_body)
+@app.get("/voice/twiml")
+async def voice_twiml(session_id: str):
+    """
+    Twilio hits this the moment the call connects. Returns TwiML that
+    speaks the question and gathers a spoken answer.
+    """
+    session = SESSIONS.get(session_id)
+    question = session["question"] if session else "No question found for this session."
 
-    if x_github_event == "issue_comment":
-        handle_issue_comment(payload)
-    elif x_github_event == "pull_request":
-        handle_pull_request(payload)
-    elif x_github_event == "pull_request_review_comment":
-        handle_review_comment(payload)
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action=f"{BASE_URL}/voice/answer?session_id={session_id}",
+        speech_timeout="auto",
+        method="POST",
+    )
+    gather.say(f"Hi, this is your agent. It's stuck and needs input. {question}")
+    response.append(gather)
+
+    # If Gather times out with no speech, fall through to this instead of
+    # silently hanging up.
+    response.say("I didn't catch that. Goodbye.")
+
+    return PlainTextResponse(content=str(response), media_type="application/xml")
+
+
+@app.post("/voice/answer")
+async def voice_answer(session_id: str, SpeechResult: str = Form(default="")):
+    """
+    Twilio POSTs here with the transcribed speech once you've answered.
+    """
+    if session_id in SESSIONS:
+        SESSIONS[session_id]["answer"] = SpeechResult
+        log.info("Session %s answered: %s", session_id, SpeechResult)
     else:
-        log.info("Ignoring event type: %s", x_github_event)
+        log.warning("Got answer for unknown session %s", session_id)
 
-    return {"ok": True}
-
-
-def handle_issue_comment(payload: dict) -> None:
-    action = payload.get("action")  # created / edited / deleted
-    comment = payload.get("comment", {})
-    sender_login = comment.get("user", {}).get("login")
-    body = comment.get("body", "")
-    issue_number = payload.get("issue", {}).get("number")
-    repo = payload.get("repository", {}).get("full_name")
-
-    if not is_from_copilot(sender_login):
-        log.info("issue_comment from non-Copilot user (%s) — ignoring", sender_login)
-        return
-
-    log.info(
-        "COPILOT COMMENT [%s] repo=%s issue=#%s\n---\n%s\n---",
-        action, repo, issue_number, body,
-    )
-    # TODO (step 2): send `body` to the classifier (DONE / BLOCKED / PROGRESS)
+    response = VoiceResponse()
+    response.say("Got it, thanks. Goodbye.")
+    response.hangup()
+    return PlainTextResponse(content=str(response), media_type="application/xml")
 
 
-def handle_pull_request(payload: dict) -> None:
-    action = payload.get("action")  # opened / synchronize / closed / etc
-    pr = payload.get("pull_request", {})
-    sender_login = pr.get("user", {}).get("login")
-    repo = payload.get("repository", {}).get("full_name")
+@app.get("/answer/{session_id}")
+async def get_answer(session_id: str):
+    """
+    Polled by the LangGraph driver. Returns 202 while waiting, 200 with
+    the answer once Twilio has relayed it.
+    """
+    session = SESSIONS.get(session_id)
+    if session is None:
+        return PlainTextResponse("unknown session_id", status_code=404)
+    if session["answer"] is None:
+        return PlainTextResponse("pending", status_code=202)
+    return {"answer": session["answer"]}
 
-    if not is_from_copilot(sender_login):
-        return
 
-    log.info(
-        "COPILOT PR EVENT [%s] repo=%s pr=#%s title=%r",
-        action, repo, pr.get("number"), pr.get("title"),
-    )
-
-
-def handle_review_comment(payload: dict) -> None:
-    comment = payload.get("comment", {})
-    sender_login = comment.get("user", {}).get("login")
-    if not is_from_copilot(sender_login):
-        return
-
-    repo = payload.get("repository", {}).get("full_name")
-    pr_number = payload.get("pull_request", {}).get("number")
-    log.info(
-        "COPILOT REVIEW COMMENT repo=%s pr=#%s\n---\n%s\n---",
-        repo, pr_number, comment.get("body", ""),
-    )
+@app.get("/")
+async def root():
+    return {"service": "orchestrator", "status": "running"}
 
 
 @app.get("/health")
