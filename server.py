@@ -152,6 +152,44 @@ async def startup():
 
 @app.post("/ask")
 async def ask(request: Request):
+    body = await request.json()
+    session_id = body["session_id"]
+    question = body["question"]
+
+    redis_key = f"session:{session_id}"
+
+    redis_client.hset(
+        redis_key,
+        mapping={
+            "question": question,
+            "answer": "",
+        },
+    )
+
+    redis_client.expire(
+        redis_key,
+        10 * 60,
+    )
+
+    log.info("New session %s: %s", session_id, question)
+
+    # KEEP THIS EXACTLY LIKE YOUR ORIGINAL VERSION
+    call = twilio_client.calls.create(
+        to=TWILIO_TO_NUMBER,
+        from_=TWILIO_FROM_NUMBER,
+        url=f"{BASE_URL}/voice/twiml?session_id={session_id}",
+    )
+
+    log.info(
+        "Placed call %s for session %s",
+        call.sid,
+        session_id,
+    )
+
+    return {
+        "ok": True,
+        "call_sid": call.sid,
+    }
     """
     Called by the LangGraph driver when its agent hits interrupt().
 
@@ -213,10 +251,9 @@ async def ask(request: Request):
         url=(
             f"{BASE_URL}/voice/twiml"
             f"?session_id={session_id}"
-        ),
+        )
 
-        # Explicitly tell Twilio to POST to the URL.
-        method="POST",
+       
     )
 
     log.info(
