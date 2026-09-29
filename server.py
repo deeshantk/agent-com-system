@@ -331,9 +331,9 @@ async def voice_twiml(session_id: str):
         ),
 
         # Wait up to 10 seconds for the caller to begin speaking.
-        timeout=10,
+        timeout=20,
         # After speech starts, require 5 seconds of silence to finish.
-        speech_timeout="5",
+        speech_timeout="10",
         # Send empty results to /voice/answer so we can retry.
         action_on_empty_result=True,
 
