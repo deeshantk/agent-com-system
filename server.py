@@ -175,87 +175,16 @@ async def ask(request: Request):
 
     log.info("New session %s: %s", session_id, question)
 
+    # Remember this as the "active" session so an INBOUND call (you
+    # dialing the Twilio number yourself) knows which question to read
+    # out, without needing a session_id in the URL.
+    redis_client.set("latest_session_id", session_id, ex=SESSION_TTL_SECONDS)
+
     # KEEP THIS EXACTLY LIKE YOUR ORIGINAL VERSION
     call = twilio_client.calls.create(
         to=TWILIO_TO_NUMBER,
         from_=TWILIO_FROM_NUMBER,
         url=f"{BASE_URL}/voice/twiml?session_id={session_id}",
-    )
-
-    log.info(
-        "Placed call %s for session %s",
-        call.sid,
-        session_id,
-    )
-
-    return {
-        "ok": True,
-        "call_sid": call.sid,
-    }
-    """
-    Called by the LangGraph driver when its agent hits interrupt().
-
-    Body:
-        {
-            "session_id": "...",
-            "question": "..."
-        }
-
-    This endpoint:
-
-        1. Stores the question in Redis
-        2. Creates the Twilio phone call
-        3. Returns immediately
-
-    The driver polls /answer/{session_id} separately.
-    """
-
-    body = await request.json()
-
-    session_id = body["session_id"]
-    question = body["question"]
-
-    redis_key = session_key(session_id)
-
-    # --------------------------------------------------------
-    # Store session in Redis
-    # --------------------------------------------------------
-
-    redis_client.hset(
-        redis_key,
-        mapping={
-            "question": question,
-            "answer": "",
-        },
-    )
-
-    # Automatically remove the session after 10 minutes.
-    redis_client.expire(
-        redis_key,
-        SESSION_TTL_SECONDS,
-    )
-
-    log.info(
-        "New session %s: %s",
-        session_id,
-        question,
-    )
-
-    # --------------------------------------------------------
-    # Place Twilio call
-    # --------------------------------------------------------
-
-    call = twilio_client.calls.create(
-        to=TWILIO_TO_NUMBER,
-        from_=TWILIO_FROM_NUMBER,
-
-        # Twilio will request this URL when the call connects.
-        url=(
-            f"{BASE_URL}/voice/twiml"
-            f"?session_id={session_id}"
-        )
-
-       
     )
 
     log.info(
@@ -330,10 +259,13 @@ async def voice_twiml(session_id: str):
             f"?session_id={session_id}"
         ),
 
-        # Wait up to 10 seconds for the caller to begin speaking.
+        # Wait up to 20 seconds for the caller to begin speaking.
         timeout=20,
-        # After speech starts, require 5 seconds of silence to finish.
-        speech_timeout="10",
+        # "auto" uses Twilio's speech-completion model to detect when
+        # you're actually done talking, instead of guessing off a fixed
+        # silence window — a fixed number (e.g. "10") can and did trigger
+        # on a mid-sentence pause and cut the call off early.
+        speech_timeout="auto",
         # Send empty results to /voice/answer so we can retry.
         action_on_empty_result=True,
 
@@ -367,6 +299,53 @@ async def voice_twiml(session_id: str):
         content=str(response),
         media_type="application/xml",
     )
+
+
+# ============================================================
+# /voice/inbound
+# ============================================================
+
+@app.api_route("/voice/inbound", methods=["GET", "POST"])
+async def voice_inbound():
+    """
+    Hit when YOU call the Twilio number (not when Twilio calls you).
+
+    Requires a one-time Twilio console change: on your phone number's
+    config page, set "A call comes in" -> Webhook ->
+    {BASE_URL}/voice/inbound, HTTP POST.
+
+    Looks up whatever session is currently pending (no answer yet) and
+    lets you answer it by voice, same as an outbound call would.
+    """
+    session_id = redis_client.get("latest_session_id")
+    session = redis_client.hgetall(session_key(session_id)) if session_id else None
+
+    response = VoiceResponse()
+
+    if not session or session.get("answer"):
+        # No session, or it already has an answer — nothing pending.
+        response.say("There's no pending question right now. Goodbye.")
+        response.hangup()
+        return PlainTextResponse(content=str(response), media_type="application/xml")
+
+    agent_name = session.get("agent_name", "AI Agent")
+    question = session.get("question", "")
+
+    gather = Gather(
+        input="speech",
+        action=f"{BASE_URL}/voice/answer?session_id={session_id}",
+        timeout=20,
+        speech_timeout="auto",
+        action_on_empty_result=True,
+        method="POST",
+    )
+    gather.say(f"This is {agent_name}. {question} Go ahead.")
+    response.append(gather)
+
+    response.say("I didn't catch that. Goodbye.")
+    response.hangup()
+
+    return PlainTextResponse(content=str(response), media_type="application/xml")
 
 
 # ============================================================
@@ -443,7 +422,7 @@ async def voice_answer(
                 input="speech",
                 action=f"{BASE_URL}/voice/answer?session_id={session_id}",
                 timeout=10,
-                speech_timeout="5",
+                speech_timeout="auto",
                 action_on_empty_result=True,
                 method="POST",
             )
