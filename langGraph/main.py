@@ -21,13 +21,17 @@ POLL_INTERVAL_SECONDS = 3
 POLL_TIMEOUT_SECONDS = 5 * 60  # give up waiting for an answer after 5 minutes
 
 
-def ask_via_twilio(question: str, session_id: str) -> str:
+def ask_via_twilio(question: str, session_id: str, agent_name: str) -> str:
     print("\n🔴 Agent is blocked and needs input — calling you now...")
     print(f"   {question}\n")
 
     resp = requests.post(
         f"{ORCHESTRATOR_URL}/ask",
-        json={"session_id": session_id, "question": question},
+        json={
+            "session_id": session_id,
+            "question": question,
+            "agent_name": agent_name,
+        },
         timeout=30,
     )
     resp.raise_for_status()
@@ -62,8 +66,13 @@ def run_task(task_text: str) -> None:
     while "__interrupt__" in result:
         interrupt_obj = result["__interrupt__"][0]
         question = interrupt_obj.value["question"]
+        agent_name = interrupt_obj.value.get("agent_name", "AI Agent")
 
-        answer = ask_via_twilio(question, session_id=thread_id)
+        answer = ask_via_twilio(
+            question,
+            session_id=thread_id,
+            agent_name=agent_name,
+        )
 
         result = graph.invoke(Command(resume=answer), config=config)
 

@@ -155,12 +155,14 @@ async def ask(request: Request):
     body = await request.json()
     session_id = body["session_id"]
     question = body["question"]
+    agent_name = body.get("agent_name", "AI Agent")
 
     redis_key = f"session:{session_id}"
 
     redis_client.hset(
         redis_key,
         mapping={
+            "agent_name": agent_name,
             "question": question,
             "answer": "",
         },
@@ -296,8 +298,10 @@ async def voice_twiml(session_id: str):
     session = redis_client.hgetall(redis_key)
 
     if session:
+        agent_name = session.get("agent_name", "AI Agent")
         question = session.get("question", "")
     else:
+        agent_name = "AI Agent"
         question = "No question found for this session."
 
         log.warning(
@@ -326,15 +330,21 @@ async def voice_twiml(session_id: str):
             f"?session_id={session_id}"
         ),
 
-        speech_timeout="auto",
+        # Wait up to 10 seconds for the caller to begin speaking.
+        timeout=10,
+        # After speech starts, require 5 seconds of silence to finish.
+        speech_timeout="5",
+        # Send empty results to /voice/answer so we can retry.
+        action_on_empty_result=True,
 
         method="POST",
     )
 
     gather.say(
-        "Hi, this is your agent. "
-        "It's stuck and needs input. "
-        f"{question}"
+        f"Hi, this is {agent_name}. "
+        "I need your help to continue. "
+        f"{question} "
+        "Take a moment to think, then speak your answer."
     )
 
     response.append(gather)
@@ -419,16 +429,44 @@ async def voice_answer(
             session_id,
         )
 
+    # If the caller was silent, keep the call open and ask again.
+    if not SpeechResult.strip():
+        session = redis_client.hgetall(redis_key)
+        response = VoiceResponse()
+        if not session:
+            response.say("I could not find this session. Goodbye.")
+            response.hangup()
+        else:
+            agent_name = session.get("agent_name", "AI Agent")
+            question = session.get("question", "")
+            gather = Gather(
+                input="speech",
+                action=f"{BASE_URL}/voice/answer?session_id={session_id}",
+                timeout=10,
+                speech_timeout="5",
+                action_on_empty_result=True,
+                method="POST",
+            )
+            gather.say(
+                f"This is {agent_name}. "
+                "I didn't hear an answer. Take your time. "
+                f"{question}"
+            )
+            response.append(gather)
+            response.say("I still didn't hear an answer. Goodbye.")
+            response.hangup()
+
+        return PlainTextResponse(
+            content=str(response),
+            media_type="application/xml",
+        )
+
     # --------------------------------------------------------
     # Tell caller we're done
     # --------------------------------------------------------
 
     response = VoiceResponse()
-
-    response.say(
-        "Got it, thanks. Goodbye."
-    )
-
+    response.say("Got it, thanks. Goodbye.")
     response.hangup()
 
     return PlainTextResponse(

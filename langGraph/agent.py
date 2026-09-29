@@ -35,7 +35,10 @@ def ask_human(question: str) -> str:
     Do NOT guess, invent, or use placeholder values for anything you're
     unsure about — call this tool instead and wait for a real answer.
     """
-    answer = interrupt({"question": question})
+    answer = interrupt({
+        "agent_name": "Coding/Ops Agent",
+        "question": question,
+    })
     return answer
 
 
